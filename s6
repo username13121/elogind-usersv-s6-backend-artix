@@ -1,0 +1,175 @@
+#!/bin/sh
+# elogind-usersv backend for a native per-user s6/s6-rc tree on Artix.
+
+case ${1-} in
+    run)
+        ;;
+    ready)
+        [ "${2-}" = s6-ready ] || {
+            echo "s6 backend: invalid readiness token '${2-}'" >&2
+            exit 69
+        }
+        exit 0
+        ;;
+    stop)
+        pid=${2-}
+        case $pid in ''|*[!0-9]*) exit 69 ;; esac
+        [ "$pid" -gt 1 ] 2>/dev/null || exit 69
+
+        # A failed transition is harmless during partial startup or recovery.
+        /usr/bin/s6-rc -l "${XDG_RUNTIME_DIR:?}/s6-rc" -t 10000 -bDa -- change \
+            >/dev/null 2>&1 || :
+
+        # SIGTERM requests s6-svscan's graceful supervision-tree shutdown.
+        exec kill -TERM "$pid"
+        ;;
+    *)
+        exit 32
+        ;;
+esac
+
+ready_fifo=${2-}
+state=${3-}
+
+[ "${ELOGIND_USERSV_BACKEND_PROTOCOL-}" = 1 ] || {
+    echo "s6 backend: unsupported elogind-usersv backend protocol" >&2
+    exit 69
+}
+[ -p "$ready_fifo" ] || {
+    echo "s6 backend: invalid readiness FIFO '$ready_fifo'" >&2
+    exit 69
+}
+[ -d "$state" ] || {
+    echo "s6 backend: invalid state directory '$state'" >&2
+    exit 69
+}
+case ${HOME-} in
+    /*) ;;
+    *)
+        echo "s6 backend: HOME is not an absolute path: '${HOME-}'" >&2
+        exit 70
+        ;;
+esac
+[ -d "$HOME" ] || {
+    echo "s6 backend: HOME directory does not exist: '$HOME'" >&2
+    exit 70
+}
+
+require_absolute_path()
+{
+    value=$1
+    name=$2
+    case $value in
+        /*) ;;
+        *)
+            echo "s6 backend: $name is not an absolute verified path" >&2
+            exit 70
+            ;;
+    esac
+}
+
+require_absolute_path "${XDG_CONFIG_HOME-}" XDG_CONFIG_HOME
+require_absolute_path "${XDG_STATE_HOME-}" XDG_STATE_HOME
+require_absolute_path "${XDG_RUNTIME_DIR-}" XDG_RUNTIME_DIR
+[ -d "$XDG_RUNTIME_DIR" ] || {
+    echo "s6 backend: XDG_RUNTIME_DIR does not exist: '$XDG_RUNTIME_DIR'" >&2
+    exit 70
+}
+
+set -eu
+
+# Artix per-user policy. The global stores are package/admin owned; all other
+# paths are relative to elogind-usersv's verified XDG directories.
+package_store=/etc/s6/user/sv
+administrator_store=/etc/s6/user/adminsv
+user_store=$XDG_CONFIG_HOME/s6/sv
+repository=$XDG_STATE_HOME/s6/repo
+boot_database=$XDG_STATE_HOME/s6/rc/compiled
+livedir=$XDG_RUNTIME_DIR/s6-rc
+scandir=$XDG_RUNTIME_DIR/service
+
+[ -d "$package_store" ] || {
+    echo "s6 backend: package store does not exist: '$package_store'" >&2
+    exit 70
+}
+[ -d "$administrator_store" ] || {
+    echo "s6 backend: administrator store does not exist: '$administrator_store'" >&2
+    exit 70
+}
+
+umask 077
+mkdir -p "$user_store" "${boot_database%/*}" "$scandir"
+
+# Later stores override earlier stores. Updating an existing repository changes
+# its store links while preserving the current set's service prescriptions.
+if [ ! -e "$repository" ] && [ ! -L "$repository" ]; then
+    /usr/bin/s6-rc-repo-init -r "$repository" -- \
+        "$package_store" "$administrator_store" "$user_store"
+    /usr/bin/s6-rc-set-new -r "$repository" -- current
+else
+    /usr/bin/s6-rc-repo-init -U -r "$repository" -- \
+        "$package_store" "$administrator_store" "$user_store"
+fi
+
+# Install persistent boot state only when no live database exists. Never
+# replace a boot database underneath an existing live s6-rc instance.
+if [ ! -e "$livedir" ] && [ ! -L "$livedir" ]; then
+    /usr/bin/s6-rc-set-commit -r "$repository" -D default -f -- current
+    /usr/bin/s6-rc-set-install -r "$repository" -c "$boot_database" -l "$livedir" \
+        --no-update -- current
+fi
+
+native_ready=$state/s6-ready
+rm -f "$native_ready"
+mkfifo "$native_ready"
+manager_pid=$$
+
+# Login readiness is deliberately shallow: release PAM as soon as s6-svscan
+# enters its event loop. The s6-rc boot transaction continues asynchronously,
+# with a watchdog tied to the tracked manager PID.
+exec 4>"$ready_fifo"
+(
+    if ! IFS= read -r _ <"$native_ready"; then
+        echo "s6 backend: s6-svscan readiness FIFO closed without notification" >&2
+        exec 4>&-
+        exit 70
+    fi
+
+    printf 's6-ready\0' >&4
+    exec 4>&-
+
+    (
+        /usr/bin/s6-rc-init -l "$livedir" -c "$boot_database" -b -- "$scandir"
+        exec /usr/bin/s6-rc -l "$livedir" -b -- change default
+    ) &
+    boot_pid=$!
+    watchdog_pid=
+    terminate_boot()
+    {
+        kill -TERM "$boot_pid" 2>/dev/null || :
+        [ -z "$watchdog_pid" ] || kill -TERM "$watchdog_pid" 2>/dev/null || :
+    }
+    trap 'terminate_boot; exit 70' HUP INT TERM
+    (
+        while kill -0 "$manager_pid" 2>/dev/null; do
+            sleep 1
+        done
+        kill -TERM "$boot_pid" 2>/dev/null || :
+    ) &
+    watchdog_pid=$!
+
+    boot_status=0
+    wait "$boot_pid" || boot_status=$?
+    kill -TERM "$watchdog_pid" 2>/dev/null || :
+    wait "$watchdog_pid" 2>/dev/null || :
+    trap - HUP INT TERM
+
+    if [ "$boot_status" -ne 0 ]; then
+        echo "s6 backend: user service boot failed after manager readiness" >&2
+        exit "$boot_status"
+    fi
+) &
+exec 4>&-
+
+# The backend process becomes the manager process tracked by elogind-usersv.
+exec /usr/bin/s6-svscan -d 3 "$scandir" 3>"$native_ready"

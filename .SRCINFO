@@ -1,0 +1,16 @@
+pkgbase = elogind-usersv-backend-s6
+	pkgdesc = Native per-user s6 backend for elogind-usersv on Artix
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/username13121/elogind-usersv-s6-artix
+	arch = any
+	license = GPL-3.0-only
+	depends = elogind-usersv
+	depends = s6
+	depends = s6-rc
+	source = s6
+	source = LICENSE
+	sha256sums = 40c7f33b04da4c2472190b9460f69668191ac395e9ece6e1c231e08ad91e6cef
+	sha256sums = fb981668c18a279e285fc4d83fba1e836cc84dd4daa73c9697d3cfd2d8aca6e0
+
+pkgname = elogind-usersv-backend-s6
